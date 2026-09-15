@@ -26,6 +26,32 @@ from . import (
 )
 
 
+_DENSE_I1_RE = re.compile(r'dense<"0x([0-9A-Fa-f]*)"> : (vector|tensor)<((?:\d+x)*\d+)xi1>')
+
+
+def _convert_dense_i1_blobs_for_spine_opt(linalg_ir: str) -> str:
+    # spine-triton-opt (MLIR of the LLVM the plugin is built against)
+    # serializes dense i1 attributes as bit-packed hex blobs, while spine-opt
+    # (spine-mlir) parses them as one byte per element. Rewrite every dense
+    # i1 blob to the byte-per-element form so the linalg IR survives the
+    # cross-tool handoff.
+    def _expand(m):
+        blob, kind, dims = m.group(1), m.group(2), m.group(3)
+        num_elems = 1
+        for d in dims.split("x"):
+            num_elems *= int(d)
+        packed = bytes.fromhex(blob)
+        if len(packed) != (num_elems + 7) // 8:
+            return m.group(0)  # unexpected layout; leave the original error
+        out = bytearray(num_elems)
+        for k in range(num_elems):
+            if (packed[k // 8] >> (k % 8)) & 1:
+                out[k] = 1
+        return 'dense<"0x%s"> : %s<%sxi1>' % (out.hex().upper(), kind, dims)
+
+    return _DENSE_I1_RE.sub(_expand, linalg_ir)
+
+
 def _ttir_to_linalgdir(mod, metadata):
     # Get Triton-MLIR as string
     ttir_code = str(mod)
@@ -37,18 +63,150 @@ def _ttir_to_linalgdir(mod, metadata):
         spine_triton_opt_path = get_spine_triton_opt_path()
         subprocess.check_call([
             spine_triton_opt_path,
+            # spine_ext.raw_region (emitted by DSLRegionOpPattern when lowering
+            # xtle.dsl_region) is an unregistered op here — its dialect lives in
+            # spine-mlir's spine-opt downstream. Allow it so the conversion can
+            # create it in generic form.
+            "--allow-unregistered-dialect",
             src_path,
             "--triton-to-linalg-experimental",
             "-o",
             dst_path,
         ])
         dump_ir_if_needed([dst_path], metadata["name"])
-        return Path(dst_path).read_text()
+        return _convert_dense_i1_blobs_for_spine_opt(Path(dst_path).read_text())
 
 
 def _optimize_linalgdir(linalgdir: str):
     # We don't apply any optimizations now, but we can add passes if needed.
     return linalgdir
+
+
+# The lowered host memref descriptor: spine-opt lowers each memref<*xT> param
+# to (i64 rank, !llvm.ptr desc), where desc points to a StridedMemRefType
+# {allocated, aligned, offset, sizes[1], strides[1]}. The aligned data ptr is
+# field [1]. (Confirmed from gemv_host_ll.mlir.)
+_LL_DESC = "!llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>"
+
+
+def _ttir_pos_to_ll_argidx(host_arg_is_memref: list[bool]):
+    """Map each TTIR host-arg position → its start index in the LOWERED ll.mlir
+    signature. Each memref param expands to 2 ll args (i64 rank, !llvm.ptr);
+    each scalar stays 1. Returns list[int] of start indices (ordered)."""
+    starts = []
+    ll = 0
+    for is_mem in host_arg_is_memref:
+        starts.append(ll)
+        ll += 2 if is_mem else 1
+    return starts
+
+
+def _inject_mixed_llvm_llmlir(llmlir: str, func_name: str, host_arg_is_memref: list[bool], llvm_funcs,
+                              llvm_calls) -> str:
+    """Graft llvm.func siblings + host→sibling bridge into the LOWERED ll.mlir.
+
+    Done post-lowering (uniform llvm dialect) so spine-opt never sees llvm ops
+    it can't lower. For each pending call, bridge host descriptor args to the
+    sibling's i64 ABI:
+      - memref: load its (i64 rank,!llvm.ptr) descriptor's [1] aligned ptr,
+        llvm.ptrtoint → i64  (sibling recovers it via llvm.inttoptr)
+      - scalar i32: llvm.sext → i64
+    Then `llvm.call @callee(...) : (i64,...) -> ()` before the host llvm.return.
+    Validated by mlir-translate on real gemv ll.mlir + emit_llvm_func_for_inline.
+    """
+    # The new spine-runtime/spert ABI: kernels are marked __require_context__ and
+    # spine-opt injects a leading `%arg0: i64` context handle at the ll.mlir layer
+    # (NOT present in the linalg func.func signature that host_arg_is_memref is from).
+    # So every lowered arg index is shifted by +1 relative to the linalg positions.
+    # The launcher passes spert::Context* first, then user args.
+    _CTX = 1  # leading ctx arg occupies %arg0
+    ll_start = _ttir_pos_to_ll_argidx(host_arg_is_memref)
+    ll_start = [s + _CTX for s in ll_start]
+
+    # Build each call's bridge lines separately, so each can be dropped at its
+    # own positional anchor (svector/bridge interleaving). uid stays globally
+    # unique across specs to avoid %mixN SSA-name clashes.
+    per_spec_bridges = []
+    uid = 0
+    for spec in llvm_calls:
+        callee = spec["callee"]
+        lines = []
+        operands = []
+        optys = []
+        for item in spec["arg_bridge"]:
+            pos, kind = item["pos"], item["kind"]
+            base = ll_start[pos]
+            if kind == "ptr":
+                desc_ptr = f"%arg{base + 1}"  # (rank=base, desc ptr=base+1)
+                d = f"%mix{uid}_d"
+                p = f"%mix{uid}_p"
+                i = f"%mix{uid}_i"
+                lines.append(f"    {d} = llvm.load {desc_ptr} : !llvm.ptr -> {_LL_DESC}")
+                lines.append(f"    {p} = llvm.extractvalue {d}[1] : {_LL_DESC}")
+                lines.append(f"    {i} = llvm.ptrtoint {p} : !llvm.ptr to i64")
+                operands.append(i)
+                optys.append("i64")
+            else:  # scalar: host passes it as i32 → sext to i64
+                s = f"%mix{uid}_s"
+                lines.append(f"    {s} = llvm.sext %arg{base} : i32 to i64")
+                operands.append(s)
+                optys.append("i64")
+            uid += 1
+        # Forward the host's ctx handle (i64 %arg0) so sibling program_id() works.
+        # Sibling uses spine_grid(ctx, axis) for program_id, not explicit grid args.
+        operands.append("%arg0")
+        optys.append("i64")
+        argstr = ", ".join(operands)
+        tystr = ", ".join(optys)
+        lines.append(f"    llvm.call @{callee}({argstr}) : ({tystr}) -> ()")
+        per_spec_bridges.append(lines)
+
+    # Preferred: replace each positional anchor `llvm.call @__spine_bridge_pt_N`
+    # (emitted by call_registry.py, lowered by TLEToLinalg) with its bridge, in
+    # place — preserves source order so svector stages can sit before AND after
+    # a bridge. Then strip the now-dead private stub llvm.func.
+    out = llmlir
+    anchors_replaced = 0
+    for n, lines in enumerate(per_spec_bridges):
+        anchor = f"__spine_bridge_pt_{n}"
+        m = re.search(rf"^[ \t]*llvm\.call @{re.escape(anchor)}\(\)[^\n]*$", out, re.MULTILINE)
+        if m is None:
+            continue
+        out = out[:m.start()] + "\n".join(lines) + out[m.end():]
+        # Drop the private no-arg stub: `llvm.func @anchor() { llvm.return }`.
+        out = re.sub(rf"\n[ \t]*llvm\.func[^\n]*@{re.escape(anchor)}\(\)[^\n]*\{{[^}}]*?llvm\.return[^}}]*?\}}", "",
+                     out, count=1, flags=re.DOTALL)
+        anchors_replaced += 1
+
+    if anchors_replaced == 0:
+        # Fallback (kernels compiled before anchors existed): insert all bridges
+        # before the host func's FIRST llvm.return (host is single-block).
+        host_at = out.find(f"llvm.func @{func_name}")
+        if host_at < 0:
+            raise RuntimeError(f"mixed-mode: host llvm.func @{func_name} not found in ll.mlir")
+        ret_m = None
+        for m in re.finditer(r"^[ \t]*llvm\.return\b.*$", out, re.MULTILINE):
+            if m.start() > host_at:
+                ret_m = m
+                break
+        if ret_m is None:
+            raise RuntimeError("mixed-mode: no llvm.return in host func to anchor llvm.call")
+        flat = [ln for lines in per_spec_bridges for ln in lines]
+        out = out[:ret_m.start()] + "\n".join(flat) + "\n" + out[ret_m.start():]
+
+    # Append the sibling llvm.func(s) before the module's closing brace.
+    # Sibling kernels call runtime symbols (spine_grid, spine_parallel_dispatch_Nd,
+    # ...) provided by libspert.so at dlopen time. Emit declarations so spine-opt
+    # verification passes (llvm.call requires callee visible in module).
+    # NOTE: spine-opt's e2e pipeline may already declare @spine_grid when the host
+    # uses tl.program_id (lowered to spine_grid(ctx, axis)). Declaring it again
+    # here → "redefinition of symbol named 'spine_grid'". Only emit if absent.
+    runtime_decls = []
+    if "spine_grid" not in out:
+        runtime_decls.append("llvm.func @spine_grid(i64, i64) -> i64")
+    close = out.rfind("}")
+    out = out[:close] + "\n" + "\n".join(runtime_decls) + "\n" + "\n".join(llvm_funcs) + "\n" + out[close:]
+    return out
 
 
 def _spine_mlir_linalgdir_to_llir_ref(linalgdir: str, metadata):
@@ -96,6 +254,17 @@ def _spine_mlir_linalgdir_to_llir(linalgdir: str, metadata):
             cmd_str,
             shell=True,
         )
+
+        # Mixed-mode: splice llvm.func siblings + host-side llvm.call bridges into
+        # the lowered ll.mlir (uniform llvm dialect, memrefs already descriptors).
+        # Done here (post spine-opt, pre dump/translate) so both the debug-info
+        # re-run path and the direct mlir-translate path see the injected module.
+        if "mixed_llvm_funcs" in metadata and "mixed_llvm_calls" in metadata:
+            _ll = Path(llmlir_path).read_text()
+            _ll = _inject_mixed_llvm_llmlir(_ll, metadata["name"], metadata["mixed_host_arg_kinds"],
+                                            metadata["mixed_llvm_funcs"], metadata["mixed_llvm_calls"])
+            Path(llmlir_path).write_text(_ll)
+
         dump_ir_if_needed([llmlir_path], metadata["name"])
 
         llmlir_new_path = llmlir_path
@@ -117,6 +286,18 @@ def _spine_mlir_linalgdir_to_llir(linalgdir: str, metadata):
         # LLVM-MLIR to LLVM-IR
         mlir_translate_path = get_llvm_bin_path("mlir-translate")
         subprocess.check_call([mlir_translate_path, llmlir_new_path, "--mlir-to-llvmir", "-o", llir_path])
+        dump_ir_if_needed([llir_path], metadata["name"])
+        return Path(llir_path).read_text()
+
+
+def _llvm_direct_to_llir(llvm_module_text: str, metadata):
+    """LLVM-direct bypass: llvm.func module → LLVM IR (skip spine-opt, only mlir-translate)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        llmlir_path = os.path.join(tmpdir, "llvm_direct.mlir")
+        llir_path = os.path.join(tmpdir, ".ll")
+        Path(llmlir_path).write_text(llvm_module_text)
+        mlir_translate_path = get_llvm_bin_path("mlir-translate")
+        subprocess.check_call([mlir_translate_path, llmlir_path, "--mlir-to-llvmir", "-o", llir_path])
         dump_ir_if_needed([llir_path], metadata["name"])
         return Path(llir_path).read_text()
 
@@ -334,21 +515,80 @@ class CPUBackend(BaseBackend):
         mod.set_attr("tt.num_threads", builder.get_int32_attr(num_threads))
         mod.set_attr("tt.arch_id", builder.get_string_attr(arch_id))
         mod.set_attr("tt.force_vector_interleave", builder.get_int32_attr(force_vector_interleave))
+
+        # LLVM-direct: pick up a pending llvm.func module text stashed by
+        # spine_raw.call() during make_ir (process-global handoff — see
+        # call_registry.take_pending_llvm_direct_module). None for non-llvm-direct kernels.
+        _llvm_direct_text, _llvm_direct_name = None, None
+        try:
+            from triton.language.extra.spine_raw.call_registry import take_pending_llvm_direct_module
+            _llvm_direct_text, _llvm_direct_name = take_pending_llvm_direct_module()
+            if _llvm_direct_text:
+                metadata["llvm_direct_module"] = _llvm_direct_text
+        except Exception:
+            pass
+
+        # Mixed-mode (coexistence): the host keeps its func.func body (tl +
+        # spine_raw dsl_region) AND calls one or more llvm-direct siblings. Unlike
+        # the pure-LLVM path above (which REPLACES the module), here we stash the
+        # sibling func text + per-call arg bridge. Injection happens at the LOWERED
+        # ll.mlir layer (_inject_mixed_llvm_llmlir, post spine-opt) — the linalgdir
+        # layer can't host it because memrefs still carry #ptr.generic_space, which
+        # crashes extract_aligned_pointer lowering. At ll.mlir the host is uniform
+        # llvm dialect with memrefs already descriptors, so the llvm.call + sibling
+        # splice is legal. Independent of llvm_direct_module (unset in mixed).
+        try:
+            from triton.language.extra.spine_raw.call_registry import (take_pending_llvm_funcs, take_pending_llvm_calls,
+                                                                       take_pending_host_arg_kinds)
+            _mixed_funcs = take_pending_llvm_funcs()
+            _mixed_calls = take_pending_llvm_calls()
+            _mixed_arg_kinds = take_pending_host_arg_kinds()
+            if _mixed_funcs and _mixed_calls:
+                metadata["mixed_llvm_funcs"] = _mixed_funcs
+                metadata["mixed_llvm_calls"] = _mixed_calls
+                metadata["mixed_host_arg_kinds"] = _mixed_arg_kinds
+        except Exception:
+            pass
+
         tt_pattern = r"tt\.func\s+public\s+@(\w+)\s*\("
         kernel_name = extract_kernel_name(tt_pattern, str(mod))
         metadata["name"] = kernel_name
+        # LLVM-direct: the binary exports the emitted llvm.func's symbol (the raw
+        # kernel name), not the @triton.jit host wrapper. The launcher looks up
+        # metadata["name"] as the symbol, so override it to the emitted name.
+        # (Mixed mode keeps the host name — the entry point is the host func.func.)
+        if _llvm_direct_text and _llvm_direct_name:
+            metadata["name"] = _llvm_direct_name
         return mod
 
     def add_stages(self, stages, options, language):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["linalgdir"] = lambda src, metadata: _optimize_linalgdir(_ttir_to_linalgdir(src, metadata))
+
+        def _linalgdir_stage(src, metadata):
+            # LLVM-direct bypass: if metadata has pre-emitted llvm.func module, return it
+            if "llvm_direct_module" in metadata:
+                return metadata["llvm_direct_module"]
+            linalgdir = _optimize_linalgdir(_ttir_to_linalgdir(src, metadata))
+            # Mixed mode: host_arg_kinds already stashed in metadata by make_ttir
+            # (populated from TTIR entry-block arg types at call() time). No
+            # text-parsing needed here.
+            return linalgdir
+
+        stages["linalgdir"] = _linalgdir_stage
 
         use_ref_pipeline = int(os.getenv("SPINE_TRITON_USE_REF_PIPELINE", "0")) > 0
 
-        if not use_ref_pipeline:
-            stages["llir"] = lambda src, metadata: _optimize_llir(_spine_mlir_linalgdir_to_llir(src, metadata))
-        else:
-            stages["llir"] = lambda src, metadata: _optimize_llir(_spine_mlir_linalgdir_to_llir_ref(src, metadata))
+        def _llir_stage(src, metadata):
+            # LLVM-direct bypass: skip spine-opt, only mlir-translate
+            if "llvm_direct_module" in metadata:
+                return _optimize_llir(_llvm_direct_to_llir(src, metadata))
+            # Normal path
+            if not use_ref_pipeline:
+                return _optimize_llir(_spine_mlir_linalgdir_to_llir(src, metadata))
+            else:
+                return _optimize_llir(_spine_mlir_linalgdir_to_llir_ref(src, metadata))
+
+        stages["llir"] = _llir_stage
 
         stages["so"] = lambda src, metadata: _llir_to_so(src, metadata)
 
