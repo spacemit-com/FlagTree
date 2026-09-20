@@ -25,7 +25,6 @@ from . import (
     get_cross_toolchain,
 )
 
-
 _DENSE_I1_RE = re.compile(r'dense<"0x([0-9A-Fa-f]*)"> : (vector|tensor)<((?:\d+x)*\d+)xi1>')
 
 

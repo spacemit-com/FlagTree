@@ -1799,8 +1799,8 @@ static void revertGetStructuredStateOp(tts::GetStructuredStateOp op,
   SmallVector<Value> replacements;
   replacements.push_back(tritonValue);
   for (size_t i = 1, e = op->getNumResults(); i < e; i++) {
-    replacements.push_back(arith::ConstantOp::create(
-        builder, op.getLoc(), builder.getIndexAttr(0)));
+    replacements.push_back(arith::ConstantOp::create(builder, op.getLoc(),
+                                                     builder.getIndexAttr(0)));
   }
   op->replaceAllUsesWith(replacements);
   op->erase();

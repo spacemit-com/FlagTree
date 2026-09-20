@@ -190,10 +190,10 @@ public:
       // pm.addPass(createCollapseShapePass());
     }
 
-    // Allow unregistered ops (spine_ext.raw_region, vector_ext.*, proton.record)
-    // allowed via --allow-unregistered-dialect command-line flag (set in
-    // compiler.py at context-creation time — safe in multi-threaded passes,
-    // cf. never call allowUnregisteredDialects inside runOnOperation).
+    // Allow unregistered ops (spine_ext.raw_region, vector_ext.*,
+    // proton.record) allowed via --allow-unregistered-dialect command-line flag
+    // (set in compiler.py at context-creation time — safe in multi-threaded
+    // passes, cf. never call allowUnregisteredDialects inside runOnOperation).
     if (failed(runPipeline(pm, getOperation()))) {
       signalPassFailure();
     }

@@ -28,9 +28,7 @@ namespace mlir::triton {
 
 namespace {
 
-static bool isScalarPtrType(Type t) {
-  return isa<triton::PointerType>(t);
-}
+static bool isScalarPtrType(Type t) { return isa<triton::PointerType>(t); }
 
 static bool isDefinedOutsideOf(Value v, Operation *scope) {
   if (auto blockArg = dyn_cast<BlockArgument>(v))
@@ -93,8 +91,7 @@ struct WhilePtrCarryToOffsetPattern : public OpRewritePattern<scf::WhileOp> {
         // Forwarded unchanged: keep the offset unchanged as well.
         info.stride = std::nullopt;
         info.offsetType = inferForwardedOffsetType(afterArgs[idx]);
-      } else if (auto addPtrOp =
-                     newYield.getDefiningOp<triton::AddPtrOp>()) {
+      } else if (auto addPtrOp = newYield.getDefiningOp<triton::AddPtrOp>()) {
         if (addPtrOp.getPtr() != afterArgs[idx])
           return failure();
         Value stride = addPtrOp.getOffset();
@@ -160,7 +157,8 @@ struct WhilePtrCarryToOffsetPattern : public OpRewritePattern<scf::WhileOp> {
         },
         [&](OpBuilder &b, Location l, ValueRange newAfterArgs) {
           IRMapping mapping;
-          for (auto [oldArg, newArg] : llvm::zip(after.getArguments(), newAfterArgs))
+          for (auto [oldArg, newArg] :
+               llvm::zip(after.getArguments(), newAfterArgs))
             mapping.map(oldArg, newArg);
           // Rebuild each carried pointer at the top of the body.
           for (size_t slot : ptrSlots) {
@@ -295,8 +293,7 @@ struct LoopPtrCarryToOffsetPass
     ifPatterns.add<IfPtrYieldToSelectPattern>(&getContext());
     FrozenRewritePatternSet frozenIf(std::move(ifPatterns));
     SmallVector<Operation *> ifOps;
-    getOperation()->walk(
-        [&](Operation *op) { ifOps.push_back(op); });
+    getOperation()->walk([&](Operation *op) { ifOps.push_back(op); });
     for (Operation *op : ifOps)
       if (isa<scf::IfOp>(op))
         (void)applyOpPatternsGreedily(ArrayRef<Operation *>(op), frozenIf);
@@ -310,6 +307,7 @@ struct LoopPtrCarryToOffsetPass
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> triton::createLoopPtrCarryToOffsetPass() {
+std::unique_ptr<OperationPass<ModuleOp>>
+triton::createLoopPtrCarryToOffsetPass() {
   return std::make_unique<LoopPtrCarryToOffsetPass>();
 }

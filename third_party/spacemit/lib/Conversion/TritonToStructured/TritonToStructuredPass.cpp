@@ -332,10 +332,9 @@ public:
     // with the tts.get_structured_state ops inserted in the prepass.
     // On failure the analysis emits a remark at the op location and reverts
     // (and erases) the op, so the op must not be touched afterwards.
-    moduleOp.walk(
-        [&ptrAnalysis](tts::GetStructuredStateOp op) {
-          (void)ptrAnalysis.rewriteGetStructuredStateOp(op);
-        });
+    moduleOp.walk([&ptrAnalysis](tts::GetStructuredStateOp op) {
+      (void)ptrAnalysis.rewriteGetStructuredStateOp(op);
+    });
   }
 };
 } // namespace

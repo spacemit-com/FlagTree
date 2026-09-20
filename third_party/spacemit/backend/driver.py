@@ -519,12 +519,8 @@ class RPCLauncher(object):
                         storage_nbytes = 0
                         itemsize = getattr(getattr(arg, "dtype", None), "itemsize", 1)
                         for later_idx, later_arg in enumerate(args[arg_idx:], arg_idx):
-                            if (
-                                later_idx not in self._constexpr_indices
-                                and later_idx not in self._constant_indices
-                                and isinstance(later_arg, int)
-                                and later_arg > 0
-                            ):
+                            if (later_idx not in self._constexpr_indices and later_idx not in self._constant_indices
+                                    and isinstance(later_arg, int) and later_arg > 0):
                                 storage_nbytes = int(later_arg) * int(itemsize)
                                 break
                         if storage_nbytes <= 0:
