@@ -21,7 +21,7 @@ import time
 import torch
 import triton
 import triton.language as tl
-from triton.backends.spine_triton.driver import CPUDriver
+from triton.backends.spacemit.driver import CPUDriver
 
 triton.runtime.driver.set_active(CPUDriver())
 import pytest

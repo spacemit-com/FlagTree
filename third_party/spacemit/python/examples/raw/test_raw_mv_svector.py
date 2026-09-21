@@ -20,7 +20,7 @@ alloc 出的 ranked scratch(packed_B),index 仍是逐维下标元组(ranked 自�
 import torch
 import triton
 import triton.language as tl
-from triton.backends.spine_triton.driver import CPUDriver
+from triton.backends.spacemit.driver import CPUDriver
 
 triton.runtime.driver.set_active(CPUDriver())
 import pytest
