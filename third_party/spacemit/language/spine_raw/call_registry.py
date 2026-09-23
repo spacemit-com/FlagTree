@@ -103,7 +103,7 @@ def call(fn, outputs=None, inputs=None, _semantic=None):
 
     # LLVM-direct bypass: detect and emit
     if getattr(fn, '_llvm_direct', False):
-        from .llvm_direct_text import emit_llvm_func_for_inline
+        from .llvm_direct import emit_llvm_func_for_inline
         from .codegen import _parse_signature
         # emit_llvm_func_for_inline needs the raw Python function, not the JIT wrapper
         raw_fn = fn._fn if hasattr(fn, '_fn') else fn
