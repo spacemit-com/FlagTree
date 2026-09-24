@@ -29,11 +29,22 @@ _DENSE_I1_RE = re.compile(r'dense<"0x([0-9A-Fa-f]*)"> : (vector|tensor)<((?:\d+x
 
 
 def _convert_dense_i1_blobs_for_spine_opt(linalg_ir: str) -> str:
-    # spine-triton-opt (MLIR of the LLVM the plugin is built against)
-    # serializes dense i1 attributes as bit-packed hex blobs, while spine-opt
-    # (spine-mlir) parses them as one byte per element. Rewrite every dense
-    # i1 blob to the byte-per-element form so the linalg IR survives the
-    # cross-tool handoff.
+    # Cross-tool serialization shim — delete once spine-triton-opt and
+    # spine-opt are built against the same MLIR generation.
+    #
+    # The new MLIR (LLVM 22 era, spine-triton-opt) prints a non-splat dense
+    # i1 attribute of >= 100 elements as a bit-packed hex blob (8 elements
+    # per byte); the older MLIR (spine-mlir, spine-opt) parses dense<"0x..">
+    # blobs as one byte per element and rejects the packed size with
+    # "elements hex data size is invalid for provided type". (Smaller
+    # non-splat i1 attrs print as dense<[...]> element lists, which both
+    # sides accept, so only large mask constants need this.)
+    #
+    # The fixup has to be textual: re-printing the module through the MLIR
+    # Python bindings would emit bit-packed blobs again (the printer format
+    # is fixed), and neither tool exposes a flag to change it. Rewrite every
+    # dense i1 blob to the byte-per-element form so the linalg IR survives
+    # the handoff.
     def _expand(m):
         blob, kind, dims = m.group(1), m.group(2), m.group(3)
         num_elems = 1
