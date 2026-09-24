@@ -96,14 +96,24 @@ class LLVMDirectCodegen:
         return ir.InsertionPoint(self._cur_blk)
 
     @staticmethod
-    def _elem_align(typ: str) -> int:
-        """Byte alignment of a scalar/vector element type (vector<[4]xf16>->2)."""
-        import re
-        m = re.search(r'x([a-z0-9]+)>', typ)  # vector<[4]xf16> -> f16
-        elem = m.group(1) if m else typ
-        bits = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64,
-                "i8": 8, "i16": 16, "i32": 32, "i64": 64}.get(elem, 8)
-        return bits // 8
+    def _elem_align(rt: ir.Type) -> int:
+        """Byte alignment of a scalar/vector element type (vector<[4]xf16>->2).
+
+        Takes the already-parsed result type and unwraps it structurally
+        (VectorType.element_type down to the scalar); no text sniffing.
+        """
+        if rt is None:
+            raise ValueError("llvm.load via call_intrinsic requires result_type=<type string>")
+        t = rt
+        while isinstance(t, ir.VectorType):
+            t = ir.VectorType(t).element_type
+        if isinstance(t, ir.FloatType):
+            width = ir.FloatType(t).width
+        elif isinstance(t, ir.IntegerType):
+            width = ir.IntegerType(t).width
+        else:
+            width = 8  # index / unknown element: byte-granular, as before
+        return width // 8
 
     # ------------------------------------------------------------------
     # Skeleton (signature shell) construction
@@ -142,7 +152,7 @@ class LLVMDirectCodegen:
         arg_tys: list[str] = []
         arg_meta: list[tuple[str, str] | None] = []  # per arg: ("mem", pname) | None
         for pname, ann in params:
-            if ann.mlir_type.startswith("memref"):
+            if ann.kind == "mem":
                 arg_tys += ["i64", "!llvm.ptr"]
                 arg_meta += [None, ("mem", pname)]
             else:  # scalar (index) passed by value as i64
@@ -193,7 +203,7 @@ class LLVMDirectCodegen:
             # declaration is guaranteed by compiler._inject_mixed_llvm_llmlir.
             self._skeleton(fn.__name__, arg_tys, declare_spine_grid=True)
             for (pname, ann), v in zip(params, self._entry_args):
-                if ann.mlir_type.startswith("memref"):
+                if ann.kind == "mem":
                     self._ptr_i64[pname] = v
                 else:  # scalar
                     self._env[pname] = v
@@ -433,7 +443,7 @@ class LLVMDirectCodegen:
                                     callee="spine_grid").result
 
             # Standalone module ABI: memref=2 args, scalar=1 arg; grid i32 trails.
-            n_user_args = sum(2 if p[1].mlir_type.startswith("memref") else 1
+            n_user_args = sum(2 if p[1].kind == "mem" else 1
                               for p in self._params)
             prog_v = self._entry_args[n_user_args + axis]
             return dllvm.sext(i64, prog_v)
@@ -468,7 +478,7 @@ class LLVMDirectCodegen:
             # emitted IR carries only the intended intrinsic calls.
             if intrin == "llvm.load":
                 # llvm.load needs an explicit alignment (element size).
-                return dllvm.load(rt, ops[0], alignment=self._elem_align(rt_s))
+                return dllvm.load(rt, ops[0], alignment=self._elem_align(rt))
             if intrin == "llvm.store":
                 dllvm.store(ops[0], ops[1])
                 return None
